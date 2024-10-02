@@ -1,0 +1,4 @@
+1 - will the satellite's be up to date with all the topology online ?
+2 - How quickly can they do communications without ground reliance.
+3 - can it be possible to send the data to the compute heavy satellite
+4 - QOS in intra satellite communications

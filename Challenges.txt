@@ -2,3 +2,9 @@
 2 - How quickly can they do communications without ground reliance.
 3 - can it be possible to send the data to the compute heavy satellite
 4 - QOS in intra satellite communications
+
+
+
+## Required
+
+1 - Understanding the distances between satellites and computation of shortest paths with equator in picture is necessary

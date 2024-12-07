@@ -1,0 +1,4 @@
+1 - Satellite's co-ordinates -- Given LEO_1 to 8 on one orbit, next on second orbit
+2 - Satellite neighbours - Updated accordingly
+3 - Source and dest choose ? -- who will decide this ? - Ground
+4 - Bandwidth, compute capacity - Go through papers, and fix these numbers.

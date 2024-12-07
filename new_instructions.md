@@ -70,6 +70,11 @@ Develop packet flow tracking and logging system
 ## 5. Visualization and Monitoring
 
 Create comprehensive visualization tools:
+next steps remaining 
+Implement path highlighting
+Add routing metrics display
+Animate topology changes
+Add more interactive features
 
 Real-time network topology
 Packet flow tracking

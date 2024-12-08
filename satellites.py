@@ -68,12 +68,13 @@ class NeighborInfo:
     active: bool = True
 
 class SatelliteThread(Thread):
-    def __init__(self, satellite_id: str, k_hops: int = 2):
+    def __init__(self, satellite_id: str, k_hops: int = 2, clock=None):
         super().__init__()
         self.id = satellite_id
-        register_satellite(self)  # Register the satellite
+        register_satellite(self)
         self.k_hops = k_hops
         self.daemon = True
+        self.clock = clock or datetime.now  # Use simulation clock if provided, else real time
         
         # Initialize metadata with random values (for simulation)
         self._metadata = SatelliteMetadata(
@@ -144,11 +145,23 @@ class SatelliteThread(Thread):
                 link_quality=link_quality,
                 start_time=start_time,
                 end_time=end_time,
-                last_seen=datetime.now(),
+                last_seen=self.clock.now(),  # Use simulation clock
                 signal_strength=random.uniform(-85, -70),
                 bandwidth_available=random.uniform(50, 100)
             )
-            logging.info(f"Satellite {self.id} added neighbor {neighbor_id}")
+            logging.info(f"{self.id}: Added neighbor {neighbor_id}")
+            
+            # Add direct route to the neighbor
+            with self.routing_lock:
+                self.routing_table[neighbor_id] = {
+                    'next_hop': neighbor_id,
+                    'hops': 1,
+                    'cost': 1.0 / link_quality,
+                    'timestamp': self.clock.now()
+                }
+            
+            # Trigger routing update
+            self.send_routing_update()
     
     def remove_neighbor(self, neighbor_id: str):
         """Remove a neighboring satellite"""
@@ -196,7 +209,7 @@ class SatelliteThread(Thread):
         logging.info(f"Satellite {self.id} started")
         
         while True:
-            current_time = datetime.now()
+            current_time = self.clock.now()  # Use simulation time
             
             # Process incoming messages
             self.process_incoming_messages()
@@ -217,7 +230,7 @@ class SatelliteThread(Thread):
                 self.send_routing_update()
                 self.last_routing_update = current_time
             
-            time.sleep(0.1)
+            time.sleep(0.1)  # Still need this for real-time simulation control
 
     def process_neighbor_updates(self):
         """Process updates in the neighbor update queue"""
@@ -277,6 +290,9 @@ class SatelliteThread(Thread):
             return
         self.seen_messages.add(message_key)
         
+        # Update neighbor's last_seen timestamp
+        self.update_neighbor_status(message.sender_id)
+        
         routes_updated = False
         with self.routing_lock:
             # First, update direct route to the sender (1 hop)
@@ -285,9 +301,10 @@ class SatelliteThread(Thread):
                     'next_hop': message.sender_id,
                     'hops': 1,
                     'cost': self.get_link_cost(message.sender_id),
-                    'timestamp': datetime.now()
+                    'timestamp': self.clock.now()  # Use simulation clock
                 }
                 routes_updated = True
+                logging.info(f"{self.id}: Added direct route to {message.sender_id}")
             
             # Process routes advertised by sender
             for dest, route_info in message.routes.items():
@@ -305,17 +322,13 @@ class SatelliteThread(Thread):
                 new_cost = route_info['cost'] + self.get_link_cost(message.sender_id)
                 
                 current_route = self.routing_table.get(dest)
+                current_time = self.clock.now()
                 
-                # Update route if:
-                # 1. No existing route
-                # 2. New route has fewer hops
-                # 3. Same hops but better cost
-                # 4. Current route is expired
                 should_update = (
                     not current_route or
                     new_hops < current_route['hops'] or
                     (new_hops == current_route['hops'] and new_cost < current_route['cost']) or
-                    (datetime.now() - current_route['timestamp']) > timedelta(minutes=5)
+                    (current_time - current_route['timestamp']) > timedelta(minutes=5)
                 )
                 
                 if should_update:
@@ -323,13 +336,13 @@ class SatelliteThread(Thread):
                         'next_hop': message.sender_id,
                         'hops': new_hops,
                         'cost': new_cost,
-                        'timestamp': datetime.now()
+                        'timestamp': current_time
                     }
                     routes_updated = True
+                    logging.info(f"{self.id}: Updated route to {dest} via {message.sender_id}")
         
         if routes_updated:
             self.print_routing_table(f"Updated by message from {message.sender_id}")
-            # Propagate updates to neighbors
             self.send_routing_update()
     
     def send_routing_update(self):

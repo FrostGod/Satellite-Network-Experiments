@@ -1,17 +1,22 @@
 from datetime import datetime, timedelta
-from satellites import Satellite, SatelliteNetwork, RoutingEngine
-from connection_parse import parse_link_topology
 import time
-from network_visualizer import create_visualizer
+import logging
+from connection_parse import parse_link_topology
+from satellites import SatelliteThread, register_satellite, get_satellite_by_id
+import random
 
-def create_test_network():
-    """Create a test satellite network from the Link Topology data"""
-    network = SatelliteNetwork()
-    
-    # Parse the link topology data
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(threadName)s - %(message)s',
+    datefmt='%H:%M:%S'
+)
+
+def setup_test_network():
+    """Create and setup test network from topology data"""
+    print("DIVI")
+    exit
+    # Parse topology data
     topology = parse_link_topology('Link Topology Table.csv')
-
-    print("DIVI ", topology) 
     
     # Extract unique satellites
     satellites = set()
@@ -20,106 +25,102 @@ def create_test_network():
             satellites.add(link['source'].split(' ')[0])
             satellites.add(link['destination'].split(' ')[0])
     
-    # Create satellites
-    for sat_id in satellites:
-        network.add_satellite(sat_id)
-        print(f"Created satellite: {sat_id}")
-    
+    # Create satellite threads
     print(len(satellites))
+    # exit
+    satellite_threads = []
+    for sat_id in satellites:
+        satellite = SatelliteThread(sat_id, k_hops=2)
+        satellite_threads.append(satellite)
+        logging.info(f"Created satellite: {sat_id}")
     
-    # Add connections between satellites
+    # Start all satellites
+    for satellite in satellite_threads:
+        satellite.start()
+    
+    # Wait for all satellites to initialize
+    time.sleep(1)
+    
+    # Add initial connections based on topology
     for link in topology:
         if link['link_type'] == 'LEO_LEO':
-            source_sat = network.get_satellite(link['source'].split(' ')[0])
-            if source_sat:
-                source_sat.add_neighbor(
-                    neighbor_id=link['destination'].split(' ')[0],
-                    start_time=link['start_time'],
-                    end_time=link['end_time'],
-                    link_quality=0.9  # Example link quality
-                )
-    
-    return network
-
-def run_routing_simulation(network: SatelliteNetwork, duration_minutes: int = 60):
-    """Run a simulation of the routing protocol"""
-    # Create routing engines for each satellite
-    routing_engines = {}
-    for sat_id, satellite in network.satellites.items():
-        routing_engines[sat_id] = RoutingEngine(satellite)
-    
-    # Simulation time parameters
-    start_time = datetime.now()
-    end_time = start_time + timedelta(minutes=duration_minutes)
-    current_time = start_time
-    
-    print("\nStarting routing simulation...")
-    print(f"Simulation period: {duration_minutes} minutes")
-    
-    # Simulation loop
-    while current_time < end_time:
-        # Process updates for each satellite
-        for sat_id, engine in routing_engines.items():
-            # Process periodic updates
-            engine.process_periodic_update(current_time)
+            source_id = link['source'].split(' ')[0]
+            dest_id = link['destination'].split(' ')[0]
             
-            # Print current routes
-            print(f"\nRoutes for {sat_id} at {current_time}:")
-            for dest, route in engine.routes.items():
-                print(f"  To {dest}: via {route.next_hop} (cost: {route.cost:.2f})")
-        
-        # Advance simulation time
-        current_time += timedelta(seconds=30)
-        time.sleep(1)  # Slow down simulation for observation
+            source_sat = get_satellite_by_id(source_id)
+            if source_sat:
+                # Add neighbor with the connection window
+                update = {
+                    'type': 'ADD',
+                    'neighbor_id': dest_id,
+                    'start_time': link['start_time'],
+                    'end_time': link['end_time'],
+                    'link_quality': random.uniform(0.7, 1.0)
+                }
+                source_sat.neighbor_update_queue.put(update)
+    
+    return satellite_threads
 
-def test_satellite_capabilities():
-    """Test individual satellite capabilities"""
-    print("\nTesting individual satellite capabilities...")
+def test_routing_updates():
+    """Test routing updates between satellites"""
+    satellites = setup_test_network()
     
-    # Create a test satellite
-    sat = Satellite("TEST_SAT_1")
+    # Let the network stabilize
+    logging.info("\nLetting network stabilize for initial routing...")
+    time.sleep(5)
     
-    # Print satellite information
-    print(sat)
+    # No need to print routing tables here as they're now printed automatically
     
-    # Test metadata updates
-    sat.update_metadata(
-        computational_capacity=1500,
-        bandwidth_capacity=800,
-        processing_power=2.5
-    )
+    # Test specific route
+    if len(satellites) >= 2:
+        sat1 = satellites[0]
+        sat2 = satellites[-1]
+        logging.info(f"\nChecking route from {sat1.id} to {sat2.id}")
+        with sat1.routing_lock:
+            if sat2.id in sat1.routing_table:
+                route = sat1.routing_table[sat2.id]
+                logging.info(
+                    f"Route found: {sat1.id} -> {route['next_hop']} "
+                    f"-> ... -> {sat2.id} (cost: {route['cost']:.2f})"
+                )
+            else:
+                logging.info(f"No route found from {sat1.id} to {sat2.id}")
     
-    print("\nAfter metadata update:")
-    print(f"Computational Capacity: {sat.metadata.computational_capacity} MIPS")
-    print(f"Bandwidth Capacity: {sat.metadata.bandwidth_capacity} Mbps")
-    print(f"Processing Power: {sat.metadata.processing_power} GHz")
+    return satellites
+
+def test_link_changes():
+    """Test network adaptation to link changes"""
+    satellites = test_routing_updates()  # Reuse the network setup
+    
+    logging.info("\nSimulating link quality changes...")
+    # Simulate link quality changes
+    for satellite in satellites[:3]:
+        for neighbor_id in list(satellite.neighbors.keys())[:2]:
+            update = {
+                'type': 'UPDATE',
+                'neighbor_id': neighbor_id,
+                'link_quality': random.uniform(0.3, 0.6)  # Degrade link quality
+            }
+            satellite.neighbor_update_queue.put(update)
+            logging.info(f"Degraded link quality between {satellite.id} and {neighbor_id}")
+    
+    # Let the network adapt
+    logging.info("\nLetting network adapt to changes...")
+    time.sleep(5)
 
 def main():
-    """Main simulation function"""
-    print("Starting Satellite Network Simulation\n")
+    """Main test function"""
+    logging.info("Starting satellite network simulation")
     
-    # Test 1: Individual Satellite Capabilities
-    test_satellite_capabilities()
+    # Test 1: Basic routing updates
+    logging.info("\n=== Testing basic routing updates ===")
+    test_routing_updates()
     
-    # Test 2: Network Creation and Routing
-    print("\nCreating satellite network...")
-    network = create_test_network()
+    # Test 2: Link changes
+    logging.info("\n=== Testing network adaptation to link changes ===")
+    test_link_changes()
     
-    print(f"\nNetwork created with {len(network.satellites)} satellites")
-    
-    # Create and run visualizer
-    app, root = create_visualizer(network)
-    
-    # Start simulation in a separate thread
-    import threading
-    sim_thread = threading.Thread(
-        target=lambda: run_routing_simulation(network, duration_minutes=5)
-    )
-    sim_thread.daemon = True
-    sim_thread.start()
-    
-    # Run GUI
-    root.mainloop()
+    logging.info("\nSimulation complete")
 
 if __name__ == "__main__":
     main() 

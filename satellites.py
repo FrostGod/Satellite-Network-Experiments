@@ -7,6 +7,9 @@ import time
 import logging
 import random
 
+
+## NOTE: Some of the data feilds are for temporary reasons, they are not used, or might be removed.
+
 # Global satellite registry to store all satellites, and identify them uniquely
 _satellite_registry: Dict[str, 'SatelliteThread'] = {}
 
@@ -68,7 +71,7 @@ class NeighborInfo:
     active: bool = True
 
 class SatelliteThread(Thread):
-    def __init__(self, satellite_id: str, k_hops: int = 2, clock=None):
+    def __init__(self, satellite_id: str, k_hops: int = 10, clock=None):
         super().__init__()
         self.id = satellite_id
         register_satellite(self)
@@ -112,7 +115,7 @@ class SatelliteThread(Thread):
         self.last_neighbor_check = datetime.now()
         
         # Update intervals
-        self.routing_update_interval = 30  # seconds
+        self.routing_update_interval = 1  # seconds
         self.last_routing_update = datetime.now()
         
         # Performance tracking
@@ -138,7 +141,7 @@ class SatelliteThread(Thread):
                     raise ValueError(f"Invalid metadata parameter: {key}")
     
     def add_neighbor(self, neighbor_id: str, start_time: datetime, 
-                    end_time: datetime, link_quality: float = 0.9):
+                    end_time: datetime, link_quality: float = 1):
         """Add or update a neighboring satellite"""
         with self.neighbor_lock:
             self.neighbors[neighbor_id] = NeighborInfo(
@@ -207,31 +210,27 @@ class SatelliteThread(Thread):
     def run(self):
         """Main thread loop"""
         logging.info(f"Satellite {self.id} started")
+        last_cleanup = self.clock.now()
         
         while True:
-            current_time = self.clock.now()  # Use simulation time
+            current_time = self.clock.now()
             
-            # Process incoming messages
+            # Process queues
+            self.process_neighbor_updates()
             self.process_incoming_messages()
             
-            # Process ground commands
-            self.process_ground_commands()
-            
-            # Process neighbor updates
-            self.process_neighbor_updates()
-            
-            # Periodic neighbor status check
-            if (current_time - self.last_neighbor_check).seconds >= self.neighbor_check_interval:
-                self.check_neighbor_status()
-                self.last_neighbor_check = current_time
-            
             # Periodic routing update
-            if (current_time - self.last_routing_update).seconds >= self.routing_update_interval:
+            if (current_time - self.last_routing_update) >= timedelta(seconds=self.routing_update_interval):
                 self.send_routing_update()
                 self.last_routing_update = current_time
             
-            time.sleep(0.1)  # Still need this for real-time simulation control
-
+            # Periodic cleanup
+            if (current_time - last_cleanup) >= timedelta(seconds=30):
+                self.cleanup_old_routes()
+                last_cleanup = current_time
+            
+            time.sleep(0.1)  # Prevent busy waiting
+    
     def process_neighbor_updates(self):
         """Process updates in the neighbor update queue"""
         while not self.neighbor_update_queue.empty():
@@ -243,15 +242,12 @@ class SatelliteThread(Thread):
                     neighbor_id=update['neighbor_id'],
                     start_time=update['start_time'],
                     end_time=update['end_time'],
-                    link_quality=update.get('link_quality', 0.9)
+                    link_quality=update.get('link_quality', 1)
                 )
-                self.print_routing_table(f"Added neighbor {update['neighbor_id']}")
-                # Trigger immediate routing update when new neighbor is added
                 self.send_routing_update()
                 
             elif update_type == 'REMOVE':
                 self.remove_neighbor(update['neighbor_id'])
-                self.print_routing_table(f"Removed neighbor {update['neighbor_id']}")
                 
             elif update_type == 'UPDATE':
                 self.update_neighbor_status(
@@ -260,7 +256,6 @@ class SatelliteThread(Thread):
                     signal_strength=update.get('signal_strength'),
                     bandwidth_available=update.get('bandwidth_available')
                 )
-                self.print_routing_table(f"Updated neighbor {update['neighbor_id']} status")
     
     def update_neighbor_status(self, neighbor_id: str, **kwargs):
         """Update neighbor status information"""
@@ -283,52 +278,54 @@ class SatelliteThread(Thread):
                 self.stats['messages_processed'] += 1
     
     def process_routing_message(self, message: RoutingMessage):
-        """Process a routing update message"""
-        # Check if we've seen this message before
+        """Process a routing update message using distance vector algorithm"""
+        # Check for duplicate messages
         message_key = (message.sender_id, message.sequence_num)
         if message_key in self.seen_messages:
             return
-        self.seen_messages.add(message_key)
         
-        # Update neighbor's last_seen timestamp
-        self.update_neighbor_status(message.sender_id)
+        self.seen_messages.add(message_key)
+        current_time = self.clock.now()
+        
+        # First verify the sender is still our neighbor
+        with self.neighbor_lock:
+            if (message.sender_id not in self.neighbors or 
+                not self.neighbors[message.sender_id].active):
+                logging.debug(f"{self.id}: Ignoring message from non-neighbor {message.sender_id}")
+                return
         
         routes_updated = False
+        
         with self.routing_lock:
-            # First, update direct route to the sender (1 hop)
-            if message.sender_id not in self.routing_table:
+            # Update direct route to sender
+            direct_cost = self.get_link_cost(message.sender_id)
+            if direct_cost != float('inf'):
                 self.routing_table[message.sender_id] = {
                     'next_hop': message.sender_id,
                     'hops': 1,
-                    'cost': self.get_link_cost(message.sender_id),
-                    'timestamp': self.clock.now()  # Use simulation clock
+                    'cost': direct_cost,
+                    'timestamp': current_time
                 }
                 routes_updated = True
-                logging.info(f"{self.id}: Added direct route to {message.sender_id}")
             
-            # Process routes advertised by sender
+            # Process routes from the message
             for dest, route_info in message.routes.items():
                 if dest == self.id:  # Skip routes to self
                     continue
-                
-                # Calculate new hop count through this neighbor
+                    
                 new_hops = route_info['hops'] + 1
-                
-                # Only consider routes within k_hops limit
-                if new_hops > self.k_hops:
+                if new_hops > self.k_hops:  # Skip if exceeds hop limit
                     continue
                 
-                # Calculate new cost
-                new_cost = route_info['cost'] + self.get_link_cost(message.sender_id)
-                
+                new_cost = route_info['cost'] + direct_cost
                 current_route = self.routing_table.get(dest)
-                current_time = self.clock.now()
                 
                 should_update = (
-                    not current_route or
-                    new_hops < current_route['hops'] or
-                    (new_hops == current_route['hops'] and new_cost < current_route['cost']) or
-                    (current_time - current_route['timestamp']) > timedelta(minutes=5)
+                    not current_route or  # No existing route
+                    new_cost < current_route['cost'] or  # Better cost
+                    (message.sender_id == current_route['next_hop'] and  # Update from current next hop
+                     (new_cost != current_route['cost'] or 
+                      new_hops != current_route['hops']))
                 )
                 
                 if should_update:
@@ -339,73 +336,113 @@ class SatelliteThread(Thread):
                         'timestamp': current_time
                     }
                     routes_updated = True
-                    logging.info(f"{self.id}: Updated route to {dest} via {message.sender_id}")
+                    logging.info(
+                        f"{self.id}: Updated route to {dest} via {message.sender_id} "
+                        f"(hops: {new_hops}, cost: {new_cost})"
+                    )
         
+        # Trigger update if routes changed
         if routes_updated:
-            self.print_routing_table(f"Updated by message from {message.sender_id}")
+            # Add small random delay to avoid synchronization
+            time.sleep(random.uniform(0.1, 0.3))
             self.send_routing_update()
     
     def send_routing_update(self):
         """Send routing updates to neighbors"""
-        self.sequence_num += 1
-        current_time = datetime.now()
+        current_time = self.clock.now()
+        
+        # Get active neighbors
+        print("DIVI 3")
+        with self.neighbor_lock:
+            print("DIVI 4")
+            active_neighbors = {
+                n_id: info for n_id, info in self.neighbors.items()
+                if info.active and info.start_time <= current_time <= info.end_time
+            }
+        
+        if not active_neighbors:
+            return  # No active neighbors to send updates to
+        
+        # Prepare routes while holding routing_lock
         
         with self.routing_lock:
-            routes = {}
+            routes = {
+                dest: {
+                    'hops': route['hops'],
+                    'cost': route['cost']
+                }
+                for dest, route in self.routing_table.items()
+                if route['hops'] < self.k_hops
+            }
             
-            # Include all valid routes within k_hops
-            for dest, route in self.routing_table.items():
-                # Only advertise fresh routes within k_hops - 1
-                # (since neighbor will add 1 hop)
-                if (route['hops'] < self.k_hops and 
-                    (current_time - route['timestamp']) <= timedelta(minutes=5)):
-                    routes[dest] = {
-                        'hops': route['hops'],
-                        'cost': route['cost']
-                    }
+            self.sequence_num += 1
+            message = RoutingMessage(
+                sender_id=self.id,
+                sequence_num=self.sequence_num,
+                routes=routes,
+                timestamp=current_time
+            )
         
-        message = RoutingMessage(
-            sender_id=self.id,
-            sequence_num=self.sequence_num,
-            routes=routes,
-            timestamp=current_time
-        )
-        
+        # Broadcast without holding any locks
         self.broadcast_to_neighbors(message)
         self.stats['routing_updates_sent'] += 1
-        self.print_routing_table("Periodic update")
     
     def get_link_cost(self, neighbor_id: str) -> float:
-        """Calculate cost of link to neighbor based on multiple factors"""
+        """Calculate cost of link to neighbor based only on hops"""
+
+        return 1
         with self.neighbor_lock:
             if neighbor_id in self.neighbors and self.neighbors[neighbor_id].active:
-                neighbor = self.neighbors[neighbor_id]
+                # Return constant cost of 1 for all active links
+
+                ## TODO: other factors
+                # neighbor = self.neighbors[neighbor_id]
                 
-                # Combine multiple factors for link cost
-                quality_factor = 1.0 / neighbor.link_quality
-                signal_factor = abs(neighbor.signal_strength) / 100.0
-                bandwidth_factor = 1.0 / (neighbor.bandwidth_available + 1)
+                # # Combine multiple factors for link cost
+                # quality_factor = 1.0 / neighbor.link_quality
+                # signal_factor = abs(neighbor.signal_strength) / 100.0
+                # bandwidth_factor = 1.0 / (neighbor.bandwidth_available + 1)
                 
-                # Weighted combination of factors
-                cost = (0.5 * quality_factor + 
-                       0.3 * signal_factor + 
-                       0.2 * bandwidth_factor)
+                # # Weighted combination of factors
+                # cost = (0.5 * quality_factor + 
+                #        0.3 * signal_factor + 
+                #        0.2 * bandwidth_factor)
                 
-                return max(1.0, cost)  # Minimum cost of 1.0
+                # return max(1.0, cost)  # Minimum cost of 1.0
+                return 1.0
         return float('inf')
     
     def broadcast_to_neighbors(self, message: Any):
         """Send message to all active neighbors"""
+        current_time = self.clock.now()
+        print("DIVI 1")
+        # Create a copy of active neighbors while holding the lock
         with self.neighbor_lock:
-            current_time = datetime.now()
-            for neighbor_id, info in self.neighbors.items():
-                if (info.active and 
-                    info.start_time <= current_time <= info.end_time):
-                    # In a real implementation, this would use actual network communication
-                    # For now, we'll assume there's a way to get the neighbor's queue
-                    neighbor = get_satellite_by_id(neighbor_id)  # This function needs to be implemented
-                    if neighbor:
-                        neighbor.incoming_queue.put(message)
+            print("DIVI 2")
+            active_neighbors = {
+                neighbor_id: neighbor 
+                for neighbor_id, neighbor in self.neighbors.items()
+                if (neighbor.active and 
+                    neighbor.start_time <= current_time <= neighbor.end_time)
+            }
+        
+        if not active_neighbors:
+            logging.debug(f"{self.id}: No active neighbors to broadcast to")
+            return
+        
+        logging.info(f"{self.id}: Broadcasting to active neighbors: {list(active_neighbors.keys())}")
+        
+        # Send messages without holding locks
+        for neighbor_id in active_neighbors:
+            neighbor = get_satellite_by_id(neighbor_id)
+            if neighbor:
+                try:
+                    neighbor.incoming_queue.put_nowait(message)  # Use non-blocking put
+                    logging.info(f"{self.id} -> {neighbor_id}: Sent routing update")
+                except Exception as e:
+                    logging.error(f"{self.id}: Failed to send to {neighbor_id}: {e}")
+            else:
+                logging.error(f"{self.id}: Failed to find neighbor {neighbor_id}")
     
     def print_routing_table(self, reason: str = ""):
         """Print current routing table with detailed information"""
@@ -436,3 +473,19 @@ class SatelliteThread(Thread):
     def process_ground_commands(self):
         """Process commands from ground station"""
         pass  # Ignoring ground commands for now
+
+    def cleanup_old_routes(self):
+        """Remove stale routing entries"""
+        current_time = self.clock.now()
+        max_age = timedelta(seconds=self.routing_update_interval * 3)
+        
+        with self.routing_lock:
+            routes_to_remove = []
+            for dest, route in self.routing_table.items():
+                age = current_time - route['timestamp']
+                if age > max_age:
+                    routes_to_remove.append(dest)
+            
+            for dest in routes_to_remove:
+                del self.routing_table[dest]
+                logging.info(f"{self.id}: Removed stale route to {dest}")

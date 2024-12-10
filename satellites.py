@@ -352,6 +352,7 @@ class SatelliteThread(Thread):
         current_time = self.clock.now()
         
         # Get active neighbors
+        print(self.neighbors.items())
         print("DIVI 3")
         with self.neighbor_lock:
             print("DIVI 4")
